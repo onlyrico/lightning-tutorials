@@ -1,12 +1,14 @@
 import base64
+import itertools
 import json
 import os
+import platform
 import re
 import warnings
 from datetime import datetime
 from shutil import copyfile
 from textwrap import wrap
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from warnings import warn
 
 import fire
@@ -16,11 +18,12 @@ import yaml
 from pip._internal.operations import freeze
 from wcmatch import glob
 
-_PATH_HERE = os.path.dirname(__file__)
+_PATH_HERE = os.path.dirname(os.path.realpath(__file__))
 _PATH_ROOT = os.path.dirname(_PATH_HERE)
-PATH_REQ_DEFAULT = os.path.join(_PATH_ROOT, "_requirements", "default.txt")
 PATH_SCRIPT_RENDER = os.path.join(_PATH_HERE, "_ipynb-render.sh")
-PATH_SCRIPT_TEST = os.path.join(_PATH_HERE, "_ipynb-test.sh")
+PATH_SCRIPT_TEST = os.path.join(_PATH_HERE, "_ipynb-validate.sh")
+PATH_DEV_SCRIPT = os.path.join(".actions", "assistant.py")
+PATH_DEV_REQUIREMENTS = os.path.join("_requirements", "devel.txt")
 # https://askubuntu.com/questions/909918/how-to-show-unzip-progress
 UNZIP_PROGRESS_BAR = ' | awk \'BEGIN {ORS=" "} {if(NR%10==0)print "."}\''
 REPO_NAME = "lightning-tutorials"
@@ -43,8 +46,8 @@ TEMPLATE_HEADER = f"""# %%%% [markdown]
 # Open in [![Open In Colab](https://colab.research.google.com/assets/colab-badge.png){{height="20px" width="117px"}}]({COLAB_REPO_LINK}/{REPO_NAME}/blob/{BRANCH_PUBLISHED}/{DIR_NOTEBOOKS}/%(local_ipynb)s)
 #
 # Give us a ⭐ [on Github](https://www.github.com/Lightning-AI/lightning/)
-# | Check out [the documentation](https://pytorch-lightning.readthedocs.io/en/stable/)
-# | Join us [on Slack](https://www.pytorchlightning.ai/community)
+# | Check out [the documentation](https://lightning.ai/docs/)
+# | Join us [on Discord](https://discord.com/invite/tfXFetEZxv)
 
 """
 TEMPLATE_SETUP = """# %%%% [markdown]
@@ -66,7 +69,7 @@ TEMPLATE_FOOTER = """
 # The easiest way to help our community is just by starring the GitHub repos! This helps raise awareness of the cool
 # tools we're building.
 #
-# ### Join our [Slack](https://www.pytorchlightning.ai/community)!
+# ### Join our [Discord](https://discord.com/invite/tfXFetEZxv)!
 # The best way to keep up to date on the latest advancements is to join our community! Make sure to introduce yourself
 # and share your interests in `#general` channel
 #
@@ -93,9 +96,21 @@ TEMPLATE_CARD_ITEM = """
 """
 
 
-def load_requirements(path_req: str = PATH_REQ_DEFAULT) -> list:
-    """Load the requirements from a file."""
-    with open(path_req) as fopen:
+def load_requirements(folder: str = ".", fname: str = "requirements.txt", full_path: str = "") -> List[str]:
+    """Load the requirements from a file.
+
+    Args:
+        folder: path to the folder with requirements
+        fname: filename in the given folder
+        full_path: alternative and overwrite the composition of folder + fname
+
+    """
+    if not full_path:
+        full_path = os.path.join(folder, fname)
+    if not os.path.isfile(full_path):
+        warnings.warn(f"Missing expected requirement file '{full_path}'")
+        return []
+    with open(full_path) as fopen:
         req = fopen.readlines()
     req = [r[: r.index("#")] if "#" in r else r for r in req]
     req = [r.strip() for r in req]
@@ -113,7 +128,7 @@ def get_running_cuda_version() -> str:
         return ""
 
 
-def get_running_torch_version():
+def get_running_torch_version() -> str:
     """Extract the version of actual PyTorch for this runtime."""
     try:
         import torch
@@ -122,6 +137,31 @@ def get_running_torch_version():
         return ver[: ver.index("+")] if "+" in ver else ver
     except ImportError:
         return ""
+
+
+def _parse_package_name(pkg: str, keys: str = " !<=>[]@", egg_name: str = "#egg=") -> str:
+    """Parsing just the package name.
+
+    Args:
+        pkg: full package info including version coming from `pip freeze
+        keys: char separators for parsing package name and version or other info
+        egg_name: eventual passing egg names once isnralled from URL
+
+    Examples:
+        >>> _parse_package_name("torch==2.0.1+cu118")
+        'torch'
+        >>> _parse_package_name("torch-cluster==1.6.3+pt20cu118")
+        'torch-cluster'
+        >>> _parse_package_name("torch_geometric==2.4.0")
+        'torch_geometric'
+
+    """
+    if egg_name in pkg:
+        pkg = pkg[pkg.index(egg_name) + len(egg_name) :]
+    if any(c in pkg for c in keys):
+        ix = min(pkg.index(c) for c in keys if c in pkg)
+        pkg = pkg[:ix]
+    return pkg
 
 
 _TORCH_VERSION = get_running_torch_version()
@@ -154,12 +194,12 @@ class AssistantCLI:
         "lightning_examples": "Lightning-Examples",
         "flash_tutorials": "Kaggle",
     }
-    _BASH_SCRIPT_BASE = ("#!/bin/bash", "set -e", "")
+    _BASH_SCRIPT_BASE = ("#!/bin/bash", "set -ex", "")
     _EXT_ARCHIVE_ZIP = (".zip",)
     _EXT_ARCHIVE_TAR = (".tar", ".gz")
     _EXT_ARCHIVE = _EXT_ARCHIVE_ZIP + _EXT_ARCHIVE_TAR
     _AZURE_POOL = "lit-rtx-3090"
-    _AZURE_DOCKER = "pytorchlightning/tutorials:latest"
+    _AZURE_DOCKER = "pytorchlightning/tutorials:ubuntu22.04-cuda12.1.1-py3.10"
 
     @staticmethod
     def _find_meta(folder: str) -> str:
@@ -167,6 +207,7 @@ class AssistantCLI:
 
         Args:
             folder: path to the folder with python script, meta and artefacts
+
         """
         files = glob.glob(os.path.join(folder, AssistantCLI._META_FILE_REGEX), flags=glob.BRACE)
         if len(files) == 1:
@@ -180,6 +221,7 @@ class AssistantCLI:
         Args:
             folder: path to the folder with python script, meta and artefacts
             strict: raise error if meta is missing required fields
+
         """
         fpath = AssistantCLI._find_meta(folder)
         assert fpath, f"Missing meta file in folder: {folder}"
@@ -197,6 +239,7 @@ class AssistantCLI:
 
         Args:
             folder: path to the folder with python script, meta and artefacts
+
         """
         meta_files = [os.path.join(folder, f".meta.{ext}") for ext in ("yml", "yaml")]
         meta_files = [pf for pf in meta_files if os.path.isfile(pf)]
@@ -217,6 +260,7 @@ class AssistantCLI:
         Args:
             folder: path to the folder with python script, meta and artefacts
             ext: extension determining the stage - ".py" for python script nad ".ipynb" for notebook
+
         """
         files = glob.glob(os.path.join(folder, f"*{ext}"))
         if len(files) != 1:
@@ -231,6 +275,7 @@ class AssistantCLI:
 
         Args:
             folder: path to the folder with python script, meta and artefacts
+
         """
         meta = AssistantCLI._load_meta(folder)
         meta_accels = [acc.lower() for acc in meta.get("accelerator", AssistantCLI._META_ACCEL_DEFAULT)]
@@ -238,29 +283,43 @@ class AssistantCLI:
         return any(ac in meta_accels for ac in device_accels)
 
     @staticmethod
-    def _parse_requirements(folder: str) -> Tuple[str, str]:
+    def _parse_requirements(folder: str, formatted: bool = True) -> Union[Tuple[str, str], Tuple[list, list]]:
         """Parse standard requirements from meta file.
 
         Args:
             folder: path to the folder with python script, meta and artefacts
+            formatted: format it into two strings
+
         """
         meta = AssistantCLI._load_meta(folder)
-        reqs = meta.get("requirements", [])
+        requires = set(load_requirements(folder) + load_requirements(os.path.dirname(folder)))
 
         meta_pip_args = {
             k.replace(AssistantCLI._META_PIP_KEY, ""): v
             for k, v in meta.items()
             if k.startswith(AssistantCLI._META_PIP_KEY)
         }
-        pip_args = ['--find-links="https://download.pytorch.org/whl/"' + _RUNTIME_VERSIONS.get("DEVICE")]
+        pip_args = [f'--extra-index-url="https://download.pytorch.org/whl/{_RUNTIME_VERSIONS.get("DEVICE")}"']
         for pip_key in meta_pip_args:
             if not isinstance(meta_pip_args[pip_key], (list, tuple, set)):
                 meta_pip_args[pip_key] = [meta_pip_args[pip_key]]
             for arg in meta_pip_args[pip_key]:
                 arg = arg % _RUNTIME_VERSIONS
                 pip_args.append(f"--{pip_key} {arg}")
+        if formatted:
+            return " ".join([f'"{req}"' for req in requires]), " ".join(pip_args)
+        return list(requires), pip_args
 
-        return " ".join([f'"{req}"' for req in reqs]), " ".join(pip_args)
+    @staticmethod
+    def pip_install(folder: str) -> str:
+        """Print all notebook requirements to be pre-installed in format of requirements file.
+
+        Args:
+            folder: path to the folder with python script, meta and artefacts
+
+        """
+        req, args = AssistantCLI._parse_requirements(folder, formatted=False)
+        return os.linesep.join(req) + os.linesep + os.linesep.join(args)
 
     @staticmethod
     def _bash_download_data(folder: str) -> List[str]:
@@ -268,6 +327,7 @@ class AssistantCLI:
 
         Args:
             folder: path to the folder with python script, meta and artefacts
+
         """
         meta = AssistantCLI._load_meta(folder)
         datasets = meta.get("datasets", {})
@@ -299,6 +359,7 @@ class AssistantCLI:
 
         Returns:
             string with nash script content
+
         """
         cmd = list(AssistantCLI._BASH_SCRIPT_BASE) + [f"# Rendering: {folder}"]
         if not AssistantCLI.DRY_RUN:
@@ -314,7 +375,13 @@ class AssistantCLI:
             # dry run does not execute the notebooks just takes them as they are
             cmd.append(f"cp {ipynb_file} {pub_ipynb}")
             # copy and add meta config
-            cmd += [f"cp {meta_file} {pub_meta}", f"cat {pub_meta}", f"git add {pub_meta}"]
+            cmd += [
+                f"cp {meta_file} {pub_meta}",
+                'echo "#====== START OF YAML FILE ======#"',
+                f"cat {pub_meta}",
+                'echo "#======= END OF YAML FILE =======#"',
+                f"git add {pub_meta}",
+            ]
         else:
             pip_req, pip_args = AssistantCLI._parse_requirements(folder)
             cmd += [f"pip install {pip_req} --quiet {pip_args}", "pip list"]
@@ -327,7 +394,13 @@ class AssistantCLI:
             # Export the actual packages used in runtime
             cmd.append(f"meta_file=$(python .actions/assistant.py update-env-details {folder})")
             # copy and add to version the enriched meta config
-            cmd += ["echo $meta_file", "cat $meta_file", "git add $meta_file"]
+            cmd += [
+                "echo $meta_file",
+                'echo "#====== START OF YAML FILE ======#"',
+                "cat $meta_file",
+                'echo "#======= END OF YAML FILE =======#"',
+                "git add $meta_file",
+            ]
         # if thumb image is linked to the notebook, copy and version it too
         if thumb_file:
             cmd += [f"cp {thumb_file} {pub_thumb}", f"git add {pub_thumb}"]
@@ -339,7 +412,7 @@ class AssistantCLI:
             fopen.write(os.linesep.join(cmd))
 
     @staticmethod
-    def bash_test(folder: str, output_file: str = PATH_SCRIPT_TEST) -> Optional[str]:
+    def bash_validate(folder: str, output_file: str = PATH_SCRIPT_TEST, virtualenv: bool = False) -> Optional[str]:
         """Prepare bash script for running tests of a particular notebook.
 
         Args:
@@ -348,6 +421,7 @@ class AssistantCLI:
 
         Returns:
             string with nash script content
+
         """
         cmd = list(AssistantCLI._BASH_SCRIPT_BASE) + [f"# Testing: {folder}"]
         cmd += AssistantCLI._bash_download_data(folder)
@@ -355,11 +429,12 @@ class AssistantCLI:
 
         # prepare isolated environment with inheriting the global packages
         path_venv = os.path.join(folder, "venv")
-        cmd += [
-            f"python -m virtualenv --system-site-packages {path_venv}",
-            f"source {os.path.join(path_venv, 'bin', 'activate')}",
-            "pip --version",
-        ]
+        if virtualenv:
+            cmd += [
+                f"python -m virtualenv --system-site-packages {path_venv}",
+                f"source {os.path.join(path_venv, 'bin', 'activate')}",
+                "pip --version",
+            ]
 
         cmd.append(f"# available: {AssistantCLI.DEVICE_ACCELERATOR}")
         if AssistantCLI._valid_accelerator(folder):
@@ -369,8 +444,14 @@ class AssistantCLI:
             # Export the actual packages used in runtime
             cmd.append(f"meta_file=$(python .actions/assistant.py update-env-details {folder} --base_path .)")
             # show created meta config
-            cmd += ["echo $meta_file", "cat $meta_file"]
-            cmd.append(f"python -m pytest {ipynb_file} -v --nbval --nbval-cell-timeout=300")
+            cmd += [
+                "echo $meta_file",
+                'echo "#====== START OF YAML FILE ======#"',
+                "cat $meta_file",
+                'echo "#======= END OF YAML FILE =======#"',
+            ]
+            # use standard jupyter's executable via CMD
+            cmd.append(f"jupyter execute {ipynb_file} --inplace")
         else:
             pub_ipynb = os.path.join(DIR_NOTEBOOKS, f"{folder}.ipynb")
             pub_meta = pub_ipynb.replace(".ipynb", ".yaml")
@@ -378,12 +459,15 @@ class AssistantCLI:
             cmd += [
                 f"mkdir -p {os.path.dirname(pub_meta)}",
                 f"cp {meta_file} {pub_meta}",
+                'echo "#====== START OF YAML FILE ======#"',
                 f"cat {pub_meta}",
+                'echo "#======= END OF YAML FILE =======#"',
                 f"git add {pub_meta}",
             ]
             warn("Invalid notebook's accelerator for this device. So no tests will be run!!!", RuntimeWarning)
         # deactivate and clean local environment
-        cmd += ["deactivate", f"rm -rf {os.path.join(folder, 'venv')}"]
+        if virtualenv:
+            cmd += ["deactivate", f"rm -rf {os.path.join(folder, 'venv')}"]
         if not output_file:
             return os.linesep.join(cmd)
         with open(output_file, "w") as fopen:
@@ -395,6 +479,7 @@ class AssistantCLI:
 
         Args:
             folder: folder with python script
+
         """
         fpath, _, _ = AssistantCLI._valid_folder(folder, ext=".py")
         with open(fpath) as fopen:
@@ -408,7 +493,8 @@ class AssistantCLI:
         meta["description"] = meta["description"].replace(os.linesep, f"{os.linesep}# ")
 
         header = TEMPLATE_HEADER % meta
-        requires = set(load_requirements() + meta["requirements"])
+        # load local and parent requirements
+        requires = set(load_requirements(folder) + load_requirements(os.path.dirname(folder)))
         setup = TEMPLATE_SETUP % dict(requirements=" ".join([f'"{req}"' for req in requires]))
         py_script = [header + setup] + py_script + [TEMPLATE_FOOTER]
 
@@ -426,6 +512,7 @@ class AssistantCLI:
         Args:
             lines: string lines from python script
             local_dir: relative path to the folder with script
+
         """
         md = os.linesep.join([ln.rstrip() for ln in lines])
         p_imgs = []
@@ -483,31 +570,63 @@ class AssistantCLI:
             fpath_drop_folders: output file with deleted folders
             fpath_actual_dirs: files with listed all folder in particular stat
             strict: raise error if some folder outside skipped does not have valid meta file
-            root_path: path to the root tobe added for all local folder paths in files
+            root_path: path to the root to be added for all local folder paths in files
 
         Example:
             $ python assistant.py group-folders ../target-diff.txt \
                 --fpath_actual_dirs "['../dirs-main.txt', '../dirs-publication.txt']"
+
         """
+        dirs = []
+        # replace here notation with path, so later it does not fall to ignore
+        if root_path == ".":
+            root_path = os.getcwd()
+        # loading the generated changes with git diff
         with open(fpath_gitdiff) as fopen:
             changed = [ln.strip() for ln in fopen.readlines()]
-        dirs = [os.path.dirname(ln) for ln in changed]
-        # not empty paths
-        dirs = [ln for ln in dirs if ln]
+        # in case of ay key component changed, later rebuild all notebooks
+        rebuild_all = any(
+            p_key in p_changed for p_key in (PATH_DEV_SCRIPT, PATH_DEV_REQUIREMENTS) for p_changed in changed
+        )
+        dirs_changed = [os.path.dirname(ln) for ln in changed]
+        if rebuild_all:
+            dirs_changed += [p for p in os.listdir(_PATH_ROOT) if os.path.isdir(p) and p[0] not in (".", "_")]
+        # append a path to root in case you call this from other path then root
+        if root_path:
+            dirs_changed = [os.path.join(root_path, d) for d in dirs_changed]
+        # append all subfolders in case of parent requirements has been changed all related notebooks shall be updated
+        for dir in dirs_changed:
+            # in case that the diff item comes from removed folder
+            if not os.path.isdir(dir):
+                dirs += [dir]
+                continue
+            # list folder and skip all internal files, starting with . or _
+            sub_dirs = [os.path.join(dir, it) for it in os.listdir(dir) if it[0] not in (".", "_")]
+            # filter only folders
+            sub_dirs = [it for it in sub_dirs if os.path.isdir(it)]
+            # if the dir has sub-folder append then otherwise append the dir itself
+            dirs += sub_dirs if sub_dirs else [dir]
 
         if fpath_actual_dirs:
             assert isinstance(fpath_actual_dirs, list)
             assert all(os.path.isfile(p) for p in fpath_actual_dirs)
             dir_sets = [{ln.strip() for ln in open(fp).readlines()} for fp in fpath_actual_dirs]
             # get only different
-            dirs += list(set.union(*dir_sets) - set.intersection(*dir_sets))
+            dirs_diff = list(set.union(*dir_sets) - set.intersection(*dir_sets))
+            # append a path to root in case you call this from other path then root
+            if root_path:
+                dirs_diff = [os.path.join(root_path, d) for d in dirs_diff]
+            dirs += dirs_diff
 
-        if root_path:
-            dirs = [os.path.join(root_path, d) for d in dirs]
-        # unique folders
-        dirs = set(dirs)
+        # not empty paths
+        dirs = [ln for ln in dirs if ln]
         # drop folder  that start with . or _ as they are meant to be internal use only
-        dirs = [pdir for pdir in dirs if not any(ndir[0] in (".", "_") for ndir in pdir.split(os.path.sep))]
+        # when walk the folder skip empty names which is artifact of absolute path starting with /
+        dirs = [
+            pdir for pdir in dirs if not any(folder[0] in (".", "_") for folder in pdir.split(os.path.sep) if folder)
+        ]
+        # unique folders only, drop duplicates
+        dirs = set(dirs)
         # valid folder has meta
         dirs_exist = [d for d in dirs if os.path.isdir(d)]
         dirs_invalid = [d for d in dirs_exist if not AssistantCLI._find_meta(d)]
@@ -519,13 +638,13 @@ class AssistantCLI:
             if dirs_invalid:
                 raise FileNotFoundError(f"{msg} nor sub-folder: \n {os.linesep.join(dirs_invalid)}")
 
-        dirs_change = [d for d in dirs_exist if AssistantCLI._find_meta(d)]
+        dirs_with_change = [d for d in dirs_exist if AssistantCLI._find_meta(d)]
         with open(fpath_change_folders, "w") as fopen:
-            fopen.write(os.linesep.join(sorted(dirs_change)))
+            fopen.write(os.linesep.join(sorted(dirs_with_change)))
 
-        dirs_drop = [d for d in dirs if not os.path.isdir(d)]
+        dirs_were_dropped = [d for d in dirs if not os.path.isdir(d)]
         with open(fpath_drop_folders, "w") as fopen:
-            fopen.write(os.linesep.join(sorted(dirs_drop)))
+            fopen.write(os.linesep.join(sorted(dirs_were_dropped)))
 
     @staticmethod
     def generate_matrix(fpath_change_folders: str, json_indent: Optional[int] = None) -> str:
@@ -534,6 +653,7 @@ class AssistantCLI:
         Args:
             fpath_change_folders: output of previous ``group_folders``
             json_indent: makes the json more readable, recommendation is 4
+
         """
         with open(fpath_change_folders) as fopen:
             folders = [ln.strip() for ln in fopen.readlines()]
@@ -613,6 +733,7 @@ class AssistantCLI:
         path_docs_images: str = "_static/images",
         patterns: Sequence[str] = (".", "**"),
         ignore: Optional[Sequence[str]] = None,
+        strict: bool = True,
     ) -> None:
         """Copy all notebooks from a folder to doc folder.
 
@@ -623,11 +744,16 @@ class AssistantCLI:
             path_docs_images: destination path to the images' location relative to ``docs_root``
             patterns: patterns to use when glob-ing notebooks
             ignore: ignore some specific notebooks even when the given string is in path
+            strict: raise exception if copy fails
+
         """
-        all_ipynb = []
-        for pattern in patterns:
-            all_ipynb += glob.glob(os.path.join(path_root, DIR_NOTEBOOKS, pattern, "*.ipynb"))
         os.makedirs(os.path.join(docs_root, path_docs_ipynb), exist_ok=True)
+        all_ipynb = [
+            os.path.realpath(ipynb)
+            for pattern in patterns
+            for ipynb in glob.glob(os.path.join(path_root, DIR_NOTEBOOKS, pattern, "*.ipynb"))
+        ]
+        print(f"Copy following notebooks to docs folder: {all_ipynb}")
         if ignore and not isinstance(ignore, (list, set, tuple)):
             ignore = [ignore]
         elif not ignore:
@@ -647,8 +773,11 @@ class AssistantCLI:
                     path_docs_images=path_docs_images,
                 )
             except Exception as ex:
-                warnings.warn(f"Failed to copy notebook: {path_ipynb}\n{ex}", ResourceWarning)
-                continue
+                msg = f"Failed to copy notebook: {path_ipynb}\n{ex}"
+                if not strict:
+                    warnings.warn(msg, ResourceWarning)
+                    continue
+                raise FileNotFoundError(msg)
             ipynb_content.append(os.path.join(path_docs_ipynb, path_ipynb_in_dir))
 
     @staticmethod
@@ -677,12 +806,9 @@ class AssistantCLI:
             path_thumb = os.path.join(path_docs_images, path_thumb)
 
         print(f"{path_ipynb} -> {new_ipynb}")
-
         with open(path_ipynb) as fopen:
             ipynb = json.load(fopen)
-
         ipynb["cells"].append(AssistantCLI._get_card_item_cell(path_ipynb, path_meta, path_thumb))
-
         with open(new_ipynb, "w") as fopen:
             json.dump(ipynb, fopen, indent=json_indent)
         return path_ipynb_in_dir
@@ -693,27 +819,33 @@ class AssistantCLI:
 
         Args:
              folder: path to the folder
-             base_path:
+             base_path: base path with notebooks
+
+        Returns:
+            path the updated YAML file
+
         """
         meta = AssistantCLI._load_meta(folder)
-        # default is COU runtime
-        with open(PATH_REQ_DEFAULT) as fopen:
-            req = fopen.readlines()
-        req += meta.get("requirements", [])
-        req = [r.strip() for r in req]
+        meta.update(
+            {
+                "OS": platform.system(),
+                "python": platform.python_version(),
+            }
+        )
+        # load local and parent requirements
+        requires = set(load_requirements(folder) + load_requirements(os.path.dirname(folder)))
 
-        def _parse_package_name(pkg: str, keys: str = " !<=>[]@", egg_name: str = "#egg=") -> str:
-            """Parsing just the package name."""
-            if egg_name in pkg:
-                pkg = pkg[pkg.index(egg_name) + len(egg_name) :]
-            if any(c in pkg for c in keys):
-                ix = min(pkg.index(c) for c in keys if c in pkg)
-                pkg = pkg[:ix]
-            return pkg
-
-        require = {_parse_package_name(r) for r in req if r}
-        env = {_parse_package_name(p): p for p in freeze.freeze()}
-        meta["environment"] = [env[r] for r in require]
+        requires = {_parse_package_name(r) for r in requires if r}
+        # duplicate package name/key for cases with -/_ separator
+        env = {
+            **{_parse_package_name(p).replace("-", "_"): p for p in freeze.freeze()},
+            **{_parse_package_name(p).replace("_", "-"): p for p in freeze.freeze()},
+        }
+        # for debugging reasons print the env and requested packages
+        try:
+            meta["environment"] = [env[r] for r in requires]
+        except KeyError:
+            raise KeyError(f"Missing matching requirements: {requires}\n within environment: {env}")
         meta["published"] = datetime.now().isoformat()
 
         fmeta = os.path.join(base_path, folder) + ".yaml"
@@ -732,6 +864,25 @@ class AssistantCLI:
         else:
             dirs = [p for p in dirs if os.path.isdir(p)]
         return os.linesep.join(sorted(dirs))
+
+    @staticmethod
+    def aggregate_requirements(req_pattern: str, result_file: str) -> None:
+        """Load all requirements from given path pattern and dump them to a single file.
+
+        Args:
+            req_pattern: search pattern such as '*/requirements.txt'
+            result_file: path to save aggregated requirements
+
+        """
+        ls_requirements = glob.glob(req_pattern)
+        assert len(ls_requirements) > 0, "no requirements found"
+        # load and append all particular requirements
+        reqs = [load_requirements(full_path=fp) for fp in ls_requirements]
+        # try to filer only unique
+        reqs = set([r.replace(" ", "") for r in itertools.chain(*reqs)])
+        # dump result to a file
+        with open(result_file, "w") as fopen:
+            fopen.writelines(os.linesep.join(reqs))
 
 
 if __name__ == "__main__":

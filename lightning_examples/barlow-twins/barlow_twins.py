@@ -7,15 +7,15 @@
 from functools import partial
 from typing import Sequence, Tuple, Union
 
-import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as VisionF
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torchmetrics.functional import accuracy
@@ -118,7 +118,7 @@ train_dataset = CIFAR10(root=".", train=True, download=True, transform=train_tra
 val_transform = BarlowTwinsTransform(
     train=False, input_height=32, gaussian_blur=False, jitter_strength=0.5, normalize=cifar10_normalization()
 )
-val_dataset = CIFAR10(root=".", train=False, download=True, transform=train_transform)
+val_dataset = CIFAR10(root=".", train=False, download=True, transform=val_transform)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
@@ -250,7 +250,7 @@ def linear_warmup_decay(warmup_steps):
 
 
 # %%
-class BarlowTwins(L.LightningModule):
+class BarlowTwins(pl.LightningModule):
     def __init__(
         self,
         encoder,
@@ -332,7 +332,7 @@ class OnlineFineTuner(Callback):
         self.encoder_output_dim = encoder_output_dim
         self.num_classes = num_classes
 
-    def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         # add linear_eval layer and optimizer
         pl_module.online_finetuner = nn.Linear(self.encoder_output_dim, self.num_classes).to(pl_module.device)
         self.optimizer = torch.optim.Adam(pl_module.online_finetuner.parameters(), lr=1e-4)
@@ -348,8 +348,8 @@ class OnlineFineTuner(Callback):
 
     def on_train_batch_end(
         self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
         outputs: Sequence,
         batch: Sequence,
         batch_idx: int,
@@ -373,8 +373,8 @@ class OnlineFineTuner(Callback):
 
     def on_validation_batch_end(
         self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
         outputs: Sequence,
         batch: Sequence,
         batch_idx: int,
@@ -410,7 +410,7 @@ model = BarlowTwins(
 online_finetuner = OnlineFineTuner(encoder_output_dim=encoder_out_dim, num_classes=10)
 checkpoint_callback = ModelCheckpoint(every_n_epochs=100, save_top_k=-1, save_last=True)
 
-trainer = L.Trainer(
+trainer = pl.Trainer(
     max_epochs=max_epochs,
     accelerator="auto",
     devices=1,

@@ -1,0 +1,10 @@
+scipy
+scikit-learn
+torchmetrics >=1.0, <1.2
+torchtext
+transformers
+datasets <=2.21
+# todo: pin version intill reinstall with PT-eco alignment
+torch ==2.1.*
+torchvision ==0.16.*
+numpy <2.0
